@@ -1,33 +1,9 @@
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Optional: Allow cross-origin for APEX testing
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Step 1: Convert OCR output into simple key-value dict
-def extract_fields_from_ocr(document_fields: list) -> dict:
-    extracted_data = {}
-    for field in document_fields:
-        text = field.get("text")
-        if "INR" in text or "USD" in text:
-            extracted_data["Currency"] = text  # assuming the currency is part of the text
-        elif "Total" in text or "Amount" in text:
-            extracted_data["Total"] = text  # assuming total amount is part of the text
-        elif "Purpose" in text:
-            extracted_data["Purpose"] = text  # assuming purpose is captured in the OCR text
-        elif "Y" in text or "Submit" in text:
-            extracted_data["SubmitReport"] = "Y"
-    return extracted_data
-
-# Step 2: Normalize the extracted fields
+# Normalize the extracted fields
 def normalize_expense(data: dict) -> dict:
     return {
         "ReimbursementCurrencyCode": data.get("Currency", "INR"),
@@ -35,6 +11,31 @@ def normalize_expense(data: dict) -> dict:
         "Purpose": data.get("Purpose", "Not Mentioned"),
         "SubmitReport": data.get("SubmitReport", "N")
     }
+
+# Function to extract the relevant fields from Oracle DU OCR document
+def extract_fields_from_ocr(document_fields: list) -> dict:
+    extracted_data = {}
+
+    for field in document_fields:
+        text = field.get("text", "").strip()
+
+        # Look for currency (e.g., INR or USD)
+        if "INR" in text or "USD" in text:
+            extracted_data["Currency"] = text
+        
+        # Look for total amount or similar (e.g., "432.60")
+        elif any(keyword in text for keyword in ["Total", "Amount", "₹"]):
+            extracted_data["Total"] = text.strip()  # Clean amount
+
+        # Look for purpose (e.g., "Fuel Reimbursement")
+        elif "Fuel" in text or "Hotel" in text or "DMart" in text:  # Add more cases if needed
+            extracted_data["Purpose"] = text.strip()
+
+        # Handle "Submit" or "Y" for the flag
+        elif "Submit" in text or "Y" in text:
+            extracted_data["SubmitReport"] = "Y"
+    
+    return extracted_data
 
 @app.post("/extract")
 async def extract_expense(req: Request):
@@ -44,6 +45,6 @@ async def extract_expense(req: Request):
     if "documentFields" in body:
         raw_data = extract_fields_from_ocr(body["documentFields"])
     else:
-        raw_data = body  # fallback to simple format if needed
+        raw_data = body  # Fallback to simple format if needed
 
     return normalize_expense(raw_data)
