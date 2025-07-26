@@ -1,50 +1,37 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+import json
 
 app = FastAPI()
 
-# Normalize the extracted fields
-def normalize_expense(data: dict) -> dict:
+# Step 3: Define the expected format using Pydantic (for clarity/validation if needed)
+class ExpenseRequest(BaseModel):
+    ReimbursementCurrencyCode: str
+    ExpenseReportTotal: str
+    Purpose: str
+    SubmitReport: str
+
+# Optional: Normalize input JSON fields from multiple formats
+def normalize_expense(data):
     return {
-        "ReimbursementCurrencyCode": data.get("Currency", "INR"),
-        "ExpenseReportTotal": data.get("Total", "0.00"),
-        "Purpose": data.get("Purpose", "Not Mentioned"),
-        "SubmitReport": data.get("SubmitReport", "N")
+        "ReimbursementCurrencyCode": data.get("Currency") or data.get("ReimbursementCurrencyCode", "INR"),
+        "ExpenseReportTotal": str(data.get("Total") or data.get("ExpenseReportTotal", "0")),
+        "Purpose": data.get("Purpose", "General"),
+        "SubmitReport": data.get("SubmitReport", "Y")
     }
 
-# Function to extract the relevant fields from Oracle DU OCR document
-def extract_fields_from_ocr(document_fields: list) -> dict:
-    extracted_data = {}
+# Step 4: API endpoint to receive and process the uploaded JSON file
+@app.post("/convert-expense/")
+async def convert_expense(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        data = json.loads(contents.decode("utf-8"))
 
-    for field in document_fields:
-        text = field.get("text", "").strip()
+        # Clean and normalize the data to match fixed format
+        formatted_output = normalize_expense(data)
 
-        # Look for currency (e.g., INR or USD)
-        if "INR" in text or "USD" in text:
-            extracted_data["Currency"] = text
-        
-        # Look for total amount or similar (e.g., "432.60")
-        elif any(keyword in text for keyword in ["Total", "Amount", "₹"]):
-            extracted_data["Total"] = text.strip()  # Clean amount
+        return formatted_output
 
-        # Look for purpose (e.g., "Fuel Reimbursement")
-        elif "Fuel" in text or "Hotel" in text or "DMart" in text:  # Add more cases if needed
-            extracted_data["Purpose"] = text.strip()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to process file: {str(e)}")
 
-        # Handle "Submit" or "Y" for the flag
-        elif "Submit" in text or "Y" in text:
-            extracted_data["SubmitReport"] = "Y"
-    
-    return extracted_data
-
-@app.post("/extract")
-async def extract_expense(req: Request):
-    body = await req.json()
-
-    # Extract fields based on the OCR output
-    if "documentFields" in body:
-        raw_data = extract_fields_from_ocr(body["documentFields"])
-    else:
-        raw_data = body  # Fallback to simple format if needed
-
-    return normalize_expense(raw_data)
