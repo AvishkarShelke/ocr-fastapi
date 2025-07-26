@@ -1,138 +1,49 @@
-from fastapi import FastAPI, Request, File, UploadFile
-from fastapi.responses import JSONResponse
-import json
-import os
-import re
-import shutil
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-UPLOAD_DIR = "uploaded_files"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Optional: Allow cross-origin for APEX testing
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-latest_uploaded_file = None
+# Step 1: Convert OCR output into simple key-value dict
+def extract_fields_from_ocr(document_fields: list) -> dict:
+    extracted_data = {}
+    for field in document_fields:
+        text = field.get("text")
+        if "INR" in text or "USD" in text:
+            extracted_data["Currency"] = text  # assuming the currency is part of the text
+        elif "Total" in text or "Amount" in text:
+            extracted_data["Total"] = text  # assuming total amount is part of the text
+        elif "Purpose" in text:
+            extracted_data["Purpose"] = text  # assuming purpose is captured in the OCR text
+        elif "Y" in text or "Submit" in text:
+            extracted_data["SubmitReport"] = "Y"
+    return extracted_data
 
-# -------------------- Upload OCR File --------------------
-@app.post("/upload-json")
-async def upload_json(file: UploadFile = File(...)):
-    global latest_uploaded_file
+# Step 2: Normalize the extracted fields
+def normalize_expense(data: dict) -> dict:
+    return {
+        "ReimbursementCurrencyCode": data.get("Currency", "INR"),
+        "ExpenseReportTotal": data.get("Total", "0.00"),
+        "Purpose": data.get("Purpose", "Not Mentioned"),
+        "SubmitReport": data.get("SubmitReport", "N")
+    }
 
-    if not file.filename.endswith(".json") and not file.filename.endswith(".txt"):
-        return JSONResponse(content={"error": "Only .json or .txt allowed"}, status_code=400)
+@app.post("/extract")
+async def extract_expense(req: Request):
+    body = await req.json()
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Extract fields based on the OCR output
+    if "documentFields" in body:
+        raw_data = extract_fields_from_ocr(body["documentFields"])
+    else:
+        raw_data = body  # fallback to simple format if needed
 
-    latest_uploaded_file = file_path
-    return {"message": "File uploaded successfully", "file_path": file_path}
-
-# -------------------- Load OCR Words --------------------
-def load_words_from_file():
-    if not latest_uploaded_file:
-        raise Exception("No OCR file uploaded yet.")
-
-    with open(latest_uploaded_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data["pages"][0].get("words", [])
-
-# -------------------- Extract Total Amount --------------------
-def extract_total_amount(words: list) -> float:
-    lines = []
-    current_line = []
-    prev_y = None
-
-    for word in sorted(words, key=lambda w: w['boundingPolygon']['normalizedVertices'][0]['y']):
-        y = round(word['boundingPolygon']['normalizedVertices'][0]['y'], 2)
-        if prev_y is None or abs(y - prev_y) < 0.01:
-            current_line.append(word["text"])
-        else:
-            lines.append(" ".join(current_line))
-            current_line = [word["text"]]
-        prev_y = y
-    if current_line:
-        lines.append(" ".join(current_line))
-
-    # Search for totals with priority keywords
-    priority_keywords = r"(food\s*total|grand\s*total|net\s*payable|invoice\s*total|total)"
-    amounts = []
-
-    for line in lines:
-        if re.search(priority_keywords, line, re.IGNORECASE):
-            matches = re.findall(r"\d{2,6}\.\d{2}", line)
-            for amt in matches:
-                amounts.append(float(amt))
-
-    # Fallback: take max numeric value
-    if not amounts:
-        all_matches = re.findall(r"\d{2,6}\.\d{2}", " ".join(lines))
-        amounts = [float(a) for a in all_matches]
-
-    return max(amounts) if amounts else 0.0
-
-# -------------------- View OCR Words --------------------
-@app.get("/words")
-async def get_words(confidence_threshold: float = 0.0):
-    try:
-        words = load_words_from_file()
-        filtered = [
-            {"text": word["text"], "confidence": word["confidence"]}
-            for word in words
-            if word["confidence"] >= confidence_threshold
-        ]
-        return {"total_words": len(filtered), "words": filtered}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-# -------------------- Get Invoice Total --------------------
-@app.get("/invoice-total")
-async def get_invoice_total():
-    try:
-        words = load_words_from_file()
-        total = extract_total_amount(words)
-        return {"invoice_total": total}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-# -------------------- Smart Auto-Fill Report --------------------
-@app.post("/correct-report")
-async def correct_expense_report():
-    try:
-        words = load_words_from_file()
-        total = extract_total_amount(words)
-        full_text = " ".join([word["text"] for word in words]).upper()
-
-        # --- Currency Detection ---
-        if "INR" in full_text or "₹" in full_text:
-            currency = "INR"
-        elif "USD" in full_text or "$" in full_text:
-            currency = "USD"
-        elif "EUR" in full_text or "€" in full_text:
-            currency = "EUR"
-        else:
-            currency = "INR"
-
-        # --- Purpose Detection ---
-        if "DMART" in full_text:
-            purpose = "DMart Shopping"
-        elif any(keyword in full_text for keyword in ["PETROL", "FUEL", "HPCL", "IOC"]):
-            purpose = "Fuel Reimbursement"
-        elif any(keyword in full_text for keyword in ["HOTEL", "RESTAURANT", "CAFE", "FOOD"]):
-            purpose = "Food/Hotel Expense"
-        elif "MEDICAL" in full_text or "PHARMACY" in full_text:
-            purpose = "Medical Reimbursement"
-        else:
-            purpose = "General Reimbursement"
-
-        # --- Submit Flag ---
-        submit = "Y"
-
-        return {
-            "ReimbursementCurrencyCode": currency,
-            "ExpenseReportTotal": f"{total:.2f}",
-            "Purpose": purpose,
-            "SubmitReport": submit
-        }
-
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return normalize_expense(raw_data)
